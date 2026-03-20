@@ -41,9 +41,9 @@ class TmuxAgent(Agent):
         # Step 1: Clear any existing input
         await self._keys(tmux_name, "C-u")
         await asyncio.sleep(0.2)
-        # Step 2: Type the command (shell-escaped)
-        escaped = prompt.replace("'", "'\"'\"'")
-        await self._keys(tmux_name, "-l", escaped)
+        # Step 2: Type the command literally
+        # Note: -l (literal) + create_subprocess_exec = no shell escaping needed
+        await self._keys(tmux_name, "-l", prompt)
         await asyncio.sleep(0.2)
         # Step 3: Press Enter (C-m = carriage return, more reliable than Enter)
         await self._keys(tmux_name, "C-m")
@@ -60,6 +60,7 @@ class TmuxAgent(Agent):
         return True
 
     async def approve(self, session_key: str) -> bool:
+        """Allow once (option 1)."""
         tmux_name = self._get_tmux_name(session_key)
         if not tmux_name:
             return False
@@ -67,7 +68,17 @@ class TmuxAgent(Agent):
         await self._keys(tmux_name, "Enter")
         return True
 
+    async def allow_session(self, session_key: str) -> bool:
+        """Allow for this session (option 2)."""
+        tmux_name = self._get_tmux_name(session_key)
+        if not tmux_name:
+            return False
+        await self._keys(tmux_name, "s")
+        await self._keys(tmux_name, "Enter")
+        return True
+
     async def reject(self, session_key: str) -> bool:
+        """Deny (option 3)."""
         tmux_name = self._get_tmux_name(session_key)
         if not tmux_name:
             return False

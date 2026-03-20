@@ -12,7 +12,7 @@ def format_tool_use(tool_name: str, tool_input: dict) -> str:
     match tool_name:
         case "Bash":
             cmd = tool_input.get("command", "")
-            truncated = f"{cmd[:80]}..." if len(cmd) > 80 else cmd
+            truncated = f"{cmd[:500]}..." if len(cmd) > 500 else cmd
             return f"`$ {truncated}`"
         case "Read":
             return f"Reading `{tool_input.get('file_path', '?')}`"

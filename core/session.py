@@ -77,10 +77,13 @@ class SessionManager:
 
         Used by hooks when TMUX env is not available - the hook data
         contains session_id which we can match against stored sessions.
+        Checks both 'claude_session_id' (tmux attach) and 'agent_session_id' (SDK mode).
         Returns (session_key, session_data) or None.
         """
         for key, data in self.sessions.items():
             if data.get("claude_session_id") == claude_session_id:
+                return key, data
+            if data.get("agent_session_id") == claude_session_id:
                 return key, data
         return None
 
