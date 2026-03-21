@@ -401,10 +401,11 @@ async def _cmd_create(client, channel, thread_ts, session_key, name):
         )
         return
 
-    # Create tmux session running claude
+    # Create tmux session running claude in the configured default cwd
+    work_dir = cfg["default_cwd"]
     proc = await asyncio.create_subprocess_exec(
         "tmux", "new-session", "-d", "-s", name,
-        "-c", "/home/ubuntu/workspaces",
+        "-c", work_dir,
         "claude",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
@@ -436,7 +437,7 @@ async def _cmd_create(client, channel, thread_ts, session_key, name):
     await client.chat_postMessage(
         channel=channel, thread_ts=thread_ts,
         text=f":rocket: Created Claude Code session `{name}`\n"
-             f"*Working dir*: `/home/ubuntu/workspaces`\n\n"
+             f"*Working dir*: `{work_dir}`\n\n"
              f"Messages in this thread go directly to Claude.\n"
              f"Commands: `!interrupt`, `!screen`, `!kill`, `!detach`",
     )
