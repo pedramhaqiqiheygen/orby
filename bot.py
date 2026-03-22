@@ -58,6 +58,9 @@ sdk_agent = SDKAgent(
 )
 tmux_agent = TmuxAgent(session_mgr=session_mgr)
 
+# Track running SDK tasks so they can be cancelled via !kill
+_running_tasks: dict[str, asyncio.Task] = {}  # session_key -> asyncio.Task
+
 
 # -- Helpers ------------------------------------------------------------------
 
@@ -120,11 +123,26 @@ async def _handle(event: dict, client):
         await _cmd_list_sessions(client, channel, thread_ts)
         return
 
+    if prompt == "!kill":
+        await _cmd_kill(client, channel, thread_ts, session_key)
+        return
+
+    if prompt.lower().startswith("!create "):
+        await _cmd_create(client, channel, thread_ts, session_key, prompt[8:].strip())
+        return
+
+    if prompt.lower() in ("!interrupt", "!stop"):
+        # Remap to the handler below (strip the !)
+        prompt = prompt[1:]
+
     # -- Agent-specific quick commands (tmux mode) -----------------------------
 
     session = session_mgr.get(session_key)
     is_tmux = session and session.get("agent_type") == "tmux"
 
+    # Permission prompt responses — send the exact keystroke to tmux
+    # Claude Code's prompts use arrow keys + Enter, so we send the option number
+    # which navigates to that item, then Enter to select it
     if is_tmux and prompt.lower() in ("approve", "y", "yes"):
         ok = await tmux_agent.approve(session_key)
         emoji = ":white_check_mark:" if ok else ":x:"
@@ -134,13 +152,41 @@ async def _handle(event: dict, client):
     if is_tmux and prompt.lower() in ("reject", "n", "no"):
         ok = await tmux_agent.reject(session_key)
         emoji = ":white_check_mark:" if ok else ":x:"
-        await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=f"{emoji} Rejected")
+        await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=f"{emoji} Denied")
         return
 
-    if is_tmux and prompt.lower() in ("interrupt", "stop"):
-        ok = await tmux_agent.interrupt(session_key)
-        emoji = ":white_check_mark:" if ok else ":x:"
-        await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=f"{emoji} Interrupted")
+    if is_tmux and prompt.strip() in ("1", "2", "3", "4"):
+        # Numbered option — navigate to it in Claude's selector
+        # Option 1 is default (top), 2 = one down, 3 = two down, etc.
+        option_num = int(prompt.strip())
+        tmux_name = session.get("tmux_session")
+        if tmux_name:
+            # First go to top, then arrow down to the right option
+            await tmux_agent._keys(tmux_name, "Home")
+            await asyncio.sleep(0.1)
+            for _ in range(option_num - 1):
+                await tmux_agent._keys(tmux_name, "Down")
+                await asyncio.sleep(0.1)
+            await tmux_agent._keys(tmux_name, "Enter")
+            await client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=f":white_check_mark: Selected option {option_num}",
+            )
+        return
+
+    if is_tmux and prompt.lower() in ("interrupt", "stop", "!interrupt", "!stop", "esc"):
+        tmux_name = session.get("tmux_session")
+        if tmux_name:
+            # Send Escape to cancel current action, then Ctrl+C as backup
+            await tmux_agent._keys(tmux_name, "Escape")
+            await asyncio.sleep(0.2)
+            await tmux_agent._keys(tmux_name, "Escape")
+            await asyncio.sleep(0.2)
+            await tmux_agent._keys(tmux_name, "C-c")
+            await client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=":white_check_mark: Interrupted (sent Esc + Ctrl+C)",
+            )
         return
 
     # -- Route to agent --------------------------------------------------------
@@ -148,7 +194,17 @@ async def _handle(event: dict, client):
     if is_tmux:
         await _handle_tmux(client, channel, thread_ts, session_key, prompt)
     else:
-        await _handle_sdk(client, channel, thread_ts, session_key, prompt)
+        # Run SDK handler as a tracked task so !kill can cancel it
+        task = asyncio.create_task(
+            _handle_sdk(client, channel, thread_ts, session_key, prompt)
+        )
+        _running_tasks[session_key] = task
+        try:
+            await task
+        except asyncio.CancelledError:
+            log.info("SDK task cancelled for %s", session_key)
+        finally:
+            _running_tasks.pop(session_key, None)
 
 
 # -- Command implementations --------------------------------------------------
@@ -272,6 +328,118 @@ async def _attach_by_session_id(client, channel, thread_ts, session_key, target)
              f"*Working dir*: `{cwd}`\n\n"
              f"Messages in this thread go directly to Claude.\n"
              f"Commands: `approve`, `reject`, `interrupt`, `!screen`, `!detach`",
+    )
+
+
+async def _cmd_kill(client, channel, thread_ts, session_key):
+    """Kill the session attached to this thread (tmux or SDK)."""
+    session = session_mgr.get(session_key)
+
+    if not session:
+        # Check if there's a running SDK task even without a stored session
+        task = _running_tasks.pop(session_key, None)
+        if task and not task.done():
+            task.cancel()
+            await client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts,
+                text=":skull: Cancelled running task.",
+            )
+            return
+        await client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text="No session found for this thread.",
+        )
+        return
+
+    agent_type = session.get("agent_type", "sdk")
+
+    if agent_type == "tmux":
+        tmux_name = session.get("tmux_session")
+        if tmux_name:
+            proc = await asyncio.create_subprocess_exec(
+                "tmux", "kill-session", "-t", tmux_name,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate()
+            session_mgr.delete(session_key)
+            if proc.returncode == 0:
+                await client.chat_postMessage(
+                    channel=channel, thread_ts=thread_ts,
+                    text=f":skull: Killed tmux session `{tmux_name}`.",
+                )
+            else:
+                await client.chat_postMessage(
+                    channel=channel, thread_ts=thread_ts,
+                    text=f":x: tmux session `{tmux_name}` not found (may already be dead).",
+                )
+    else:
+        # SDK mode — cancel the asyncio task
+        task = _running_tasks.pop(session_key, None)
+        if task and not task.done():
+            task.cancel()
+        session_mgr.delete(session_key)
+        await client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=":skull: Killed SDK session.",
+        )
+
+
+async def _cmd_create(client, channel, thread_ts, session_key, name):
+    """Create a new Claude Code session in a named tmux session and attach this thread."""
+    if not name:
+        await client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text="Usage: `!create <session-name>`",
+        )
+        return
+
+    # Check if tmux session already exists
+    if await TmuxAgent._session_exists(name):
+        await client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=f":warning: tmux session `{name}` already exists. Use `!attach {name}` instead.",
+        )
+        return
+
+    # Create tmux session running claude in the configured default cwd
+    work_dir = cfg["default_cwd"]
+    proc = await asyncio.create_subprocess_exec(
+        "tmux", "new-session", "-d", "-s", name,
+        "-c", work_dir,
+        "claude",
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    await proc.communicate()
+
+    if proc.returncode != 0:
+        await client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=f":x: Failed to create tmux session `{name}`.",
+        )
+        return
+
+    # Wait for Claude to start up
+    await asyncio.sleep(3)
+
+    # Auto-accept workspace trust prompt
+    for _ in range(3):
+        await asyncio.sleep(1)
+        await asyncio.create_subprocess_exec(
+            "tmux", "send-keys", "-t", name, "Enter",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+
+    # Attach this thread to the new session
+    session_mgr.set(session_key, {
+        "agent_type": "tmux",
+        "tmux_session": name,
+    })
+    await client.chat_postMessage(
+        channel=channel, thread_ts=thread_ts,
+        text=f":rocket: Created Claude Code session `{name}`\n"
+             f"*Working dir*: `{work_dir}`\n\n"
+             f"Messages in this thread go directly to Claude.\n"
+             f"Commands: `!interrupt`, `!screen`, `!kill`, `!detach`",
     )
 
 
