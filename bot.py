@@ -8,12 +8,17 @@ Routes Slack messages to the correct agent backend:
 Commands:
   !attach <session>  - Attach to a tmux session or Claude session ID
   !detach            - Detach from tmux session, revert to SDK mode
+  !create <name>     - Create a new Claude Code session in tmux
   !screen            - Show current tmux pane content
   !status            - Show session info
   !sessions          - List available tmux sessions
+  !skills            - List available Claude Code skills
+  !kill              - Kill the session attached to this thread
+  !interrupt / !stop - Interrupt Claude
+  //skill-name       - Invoke a Claude Code skill (e.g. //commit)
   approve / y        - Approve a pending permission prompt (tmux mode)
   reject / n         - Reject a pending permission prompt (tmux mode)
-  interrupt / stop   - Interrupt Claude (tmux mode)
+  interrupt / stop   - Interrupt Claude
 """
 
 import asyncio
@@ -95,7 +100,9 @@ async def _handle(event: dict, client):
     if not prompt:
         await client.chat_postMessage(
             channel=channel, thread_ts=thread_ts,
-            text="Send me a message and I'll route it to Claude Code.",
+            text="Send me a message and I'll route it to Claude Code.\n"
+                 "Use `//skill-name` to invoke a skill (e.g. `//commit`, `//investigate`). "
+                 "Type `!skills` to list available skills.",
         )
         return
 
@@ -131,9 +138,19 @@ async def _handle(event: dict, client):
         await _cmd_create(client, channel, thread_ts, session_key, prompt[8:].strip())
         return
 
+    if prompt == "!skills":
+        await _cmd_skills(client, channel, thread_ts)
+        return
+
     if prompt.lower() in ("!interrupt", "!stop"):
         # Remap to the handler below (strip the !)
         prompt = prompt[1:]
+
+    # -- Skill invocation (// prefix → / for Claude Code) ----------------------
+
+    if prompt.startswith("//"):
+        prompt = prompt[1:]  # "//commit -m fix" -> "/commit -m fix"
+        log.info("Skill invocation: %s", prompt[:80])
 
     # -- Agent-specific quick commands (tmux mode) -----------------------------
 
@@ -187,6 +204,18 @@ async def _handle(event: dict, client):
                 channel=channel, thread_ts=thread_ts,
                 text=":white_check_mark: Interrupted (sent Esc + Ctrl+C)",
             )
+        return
+
+    if not is_tmux and prompt.lower() in ("interrupt", "stop"):
+        ok = await sdk_agent.interrupt(session_key)
+        task = _running_tasks.pop(session_key, None)
+        if task and not task.done():
+            task.cancel()
+        emoji = ":white_check_mark:" if ok else ":warning:"
+        await client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=f"{emoji} Interrupted SDK session.",
+        )
         return
 
     # -- Route to agent --------------------------------------------------------
@@ -373,7 +402,8 @@ async def _cmd_kill(client, channel, thread_ts, session_key):
                     text=f":x: tmux session `{tmux_name}` not found (may already be dead).",
                 )
     else:
-        # SDK mode — cancel the asyncio task
+        # SDK mode — disconnect persistent client + cancel task
+        await sdk_agent.disconnect(session_key)
         task = _running_tasks.pop(session_key, None)
         if task and not task.done():
             task.cancel()
@@ -498,6 +528,77 @@ async def _cmd_list_sessions(client, channel, thread_ts):
         await client.chat_postMessage(channel=channel, thread_ts=thread_ts, text="No tmux sessions found.")
 
 
+def _parse_skill_frontmatter(path) -> tuple[str | None, str | None]:
+    """Extract name and description from SKILL.md YAML frontmatter."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return None, None
+
+    if not text.startswith("---"):
+        for line in text.splitlines()[:5]:
+            if line.startswith("# "):
+                return line[2:].strip(), None
+        return None, None
+
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return None, None
+
+    name, desc = None, None
+    for line in parts[1].splitlines():
+        line = line.strip()
+        if line.startswith("name:"):
+            name = line[5:].strip().strip('"').strip("'")
+        elif line.startswith("description:") and "|" not in line:
+            desc = line[12:].strip().strip('"').strip("'")
+        elif desc is None and line.startswith("description:"):
+            continue  # multi-line description, grab next line
+        elif name and desc is None and line and not line.startswith(("argument", "disable", "allowed")):
+            desc = line.strip()
+    return name, desc
+
+
+async def _cmd_skills(client, channel, thread_ts):
+    """List available Claude Code skills."""
+    from pathlib import Path
+
+    skills_dir = Path.home() / ".claude" / "skills"
+    entries = []
+
+    if skills_dir.is_dir():
+        for skill_dir in sorted(skills_dir.iterdir()):
+            if not skill_dir.is_dir() or skill_dir.name.startswith("_"):
+                continue
+            skill_md = skill_dir / "SKILL.md"
+            if skill_md.exists():
+                name, desc = _parse_skill_frontmatter(skill_md)
+                display_name = name or skill_dir.name
+                entries.append((display_name, desc or ""))
+
+    if not entries:
+        await client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text="No skills found in `~/.claude/skills/`.",
+        )
+        return
+
+    lines = ["*Available Skills:*", ""]
+    for name, desc in entries:
+        prefix = f"`//{name}`"
+        if desc:
+            lines.append(f"  {prefix} — {desc[:100]}")
+        else:
+            lines.append(f"  {prefix}")
+    lines.append("")
+    lines.append("_Use `//skill-name [args]` to invoke a skill._")
+
+    await client.chat_postMessage(
+        channel=channel, thread_ts=thread_ts,
+        text="\n".join(lines),
+    )
+
+
 # -- Agent handlers ------------------------------------------------------------
 
 async def _handle_tmux(client, channel, thread_ts, session_key, prompt):
@@ -584,6 +685,7 @@ async def _handle_sdk(client, channel, thread_ts, session_key, prompt):
 # -- Main ---------------------------------------------------------------------
 
 async def main():
+    asyncio.create_task(sdk_agent.warm())  # pre-warm a client in background
     handler = AsyncSocketModeHandler(app, cfg["slack_app_token"])
     log.info("Orby is online.")
     await handler.start_async()

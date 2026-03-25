@@ -1,20 +1,21 @@
 """Claude Agent SDK backend.
 
-Creates and resumes Claude Code sessions programmatically via the Agent SDK.
-Each Slack thread maps to one SDK session with full conversation history.
+Uses persistent ClaudeSDKClient connections — one per Slack thread.
+Pre-warms clients on startup so the first message is instant.
 """
 
+import asyncio
 import logging
 import os
 
 from claude_agent_sdk import (
     AssistantMessage,
     ClaudeAgentOptions,
+    ClaudeSDKClient,
     ResultMessage,
     SystemMessage,
     TextBlock,
     ToolUseBlock,
-    query,
 )
 
 from core.agent import Agent, QueryResult, OnText, OnTool
@@ -25,7 +26,7 @@ log = logging.getLogger("orby.agents.sdk")
 
 
 class SDKAgent(Agent):
-    """Agent backed by Claude Agent SDK (programmatic sessions)."""
+    """Agent backed by Claude Agent SDK with persistent connections and pre-warming."""
 
     def __init__(self, session_mgr: SessionManager, default_cwd: str,
                  permission_mode: str, max_turns: int, allowed_tools: list[str]):
@@ -34,6 +35,75 @@ class SDKAgent(Agent):
         self.permission_mode = permission_mode
         self.max_turns = max_turns
         self.allowed_tools = allowed_tools
+        self._clients: dict[str, ClaudeSDKClient] = {}
+        self._warm_pool: list[ClaudeSDKClient] = []
+        self._warming = False
+        self._create_lock = asyncio.Lock()
+
+    def _build_options(self, work_dir: str) -> ClaudeAgentOptions:
+        return ClaudeAgentOptions(
+            cwd=work_dir,
+            allowed_tools=self.allowed_tools,
+            permission_mode=self.permission_mode,
+            max_turns=self.max_turns,
+            setting_sources=["user", "project", "local"],
+            env={"CLAUDE_CODE_STREAM_CLOSE_TIMEOUT": "180000"},
+        )
+
+    async def warm(self):
+        """Pre-warm a client in the background. Called on bot startup and after each claim."""
+        if self._warming:
+            return
+        self._warming = True
+        try:
+            os.environ.pop("CLAUDECODE", None)
+            # Set on host process so SDK's Python-side timeout reads it too
+            os.environ["CLAUDE_CODE_STREAM_CLOSE_TIMEOUT"] = "180000"
+            opts = self._build_options(self.default_cwd)
+            client = ClaudeSDKClient(options=opts)
+            log.info("Pre-warming SDK client (cwd=%s)...", self.default_cwd)
+            await client.connect()
+            self._warm_pool.append(client)
+            log.info("Pre-warmed SDK client ready (%d in pool)", len(self._warm_pool))
+        except Exception:
+            log.exception("Failed to pre-warm SDK client")
+        finally:
+            self._warming = False
+
+    def _start_warming(self):
+        """Kick off a background warm if not already running."""
+        if not self._warming and len(self._warm_pool) == 0:
+            asyncio.create_task(self.warm())
+
+    async def _get_or_create_client(self, session_key: str, work_dir: str) -> ClaudeSDKClient:
+        """Get existing client, claim a pre-warmed one, or create fresh."""
+        if session_key in self._clients:
+            return self._clients[session_key]
+
+        async with self._create_lock:
+            # Re-check after acquiring lock (another coroutine may have created it)
+            if session_key in self._clients:
+                return self._clients[session_key]
+
+            # Try to claim a pre-warmed client (only if cwd matches default)
+            if self._warm_pool and work_dir == self.default_cwd:
+                client = self._warm_pool.pop(0)
+                self._clients[session_key] = client
+                log.info("Claimed pre-warmed client for %s", session_key)
+                self._start_warming()  # replenish
+                return client
+
+            # Fallback: create fresh (blocks on init)
+            os.environ.pop("CLAUDECODE", None)
+            os.environ["CLAUDE_CODE_STREAM_CLOSE_TIMEOUT"] = "180000"
+            opts = self._build_options(work_dir)
+            client = ClaudeSDKClient(options=opts)
+            log.info("Connecting new SDK client for %s (cwd=%s)", session_key, work_dir)
+            await client.connect()
+            self._clients[session_key] = client
+            log.info("SDK client connected for %s", session_key)
+            self._start_warming()  # start warming next one
+            return client
 
     async def send(self, session_key: str, prompt: str,
                    on_text: OnText | None = None,
@@ -41,29 +111,17 @@ class SDKAgent(Agent):
         session = self.session_mgr.get(session_key)
         work_dir = (session or {}).get("cwd") or self.default_cwd
 
-        opts = ClaudeAgentOptions(
-            cwd=work_dir,
-            allowed_tools=self.allowed_tools,
-            permission_mode=self.permission_mode,
-            max_turns=self.max_turns,
-        )
-        agent_sid = (session or {}).get("agent_session_id")
-        if agent_sid:
-            opts.resume = agent_sid
-
         result = QueryResult()
         text_parts: list[str] = []
 
-        # Prevent "cannot launch inside another Claude Code session" error
-        # when Orby itself is running inside a Claude Code session
-        os.environ.pop("CLAUDECODE", None)
-
         try:
-            async for msg in query(prompt=prompt, options=opts):
+            client = await self._get_or_create_client(session_key, work_dir)
+            await client.query(prompt)
+
+            async for msg in client.receive_response():
                 if msg is None:
                     continue
 
-                # Extract session_id from SystemMessage.data or ResultMessage
                 sid = getattr(msg, "session_id", None)
                 if not sid and isinstance(msg, SystemMessage):
                     sid = (msg.data or {}).get("session_id")
@@ -97,20 +155,16 @@ class SDKAgent(Agent):
 
         except Exception as e:
             err_msg = str(e)
-            # Give a clear message for common errors
-            if "exit code 1" in err_msg and agent_sid:
-                log.error("Failed to resume session %s in %s", agent_sid[:16], work_dir)
+            self._clients.pop(session_key, None)
+
+            if "exit code" in err_msg or "not connected" in err_msg.lower():
+                log.error("SDK client error for %s: %s", session_key, err_msg)
                 result.is_error = True
-                result.text = (
-                    f"Failed to resume session `{agent_sid[:16]}...` "
-                    f"in `{work_dir}`. The session may have expired or "
-                    f"the working directory may be wrong."
-                )
+                result.text = f"Session error: {err_msg}. Next message will reconnect."
                 return result
             log.exception("Error during SDK query")
             raise
 
-        # Persist session
         if result.session_id:
             self.session_mgr.set(session_key, {
                 "agent_type": "sdk",
@@ -122,11 +176,25 @@ class SDKAgent(Agent):
         return result
 
     async def interrupt(self, session_key: str) -> bool:
-        # Not supported with the functional query() API
+        client = self._clients.get(session_key)
+        if client:
+            try:
+                await client.interrupt()
+                return True
+            except Exception:
+                log.exception("Failed to interrupt SDK session %s", session_key)
         return False
 
+    async def disconnect(self, session_key: str):
+        """Disconnect and remove a client for a session."""
+        client = self._clients.pop(session_key, None)
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                log.warning("Error disconnecting SDK client for %s", session_key)
+
     async def approve(self, session_key: str) -> bool:
-        # Not applicable - permission_mode handles this automatically
         return False
 
     async def reject(self, session_key: str) -> bool:

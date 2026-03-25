@@ -80,6 +80,8 @@ The agent abstraction (`core/agent.py`) is designed for extension. New agents im
 | `approve` / `y` | Approve a pending permission prompt (attach mode). |
 | `reject` / `n` | Reject a pending permission prompt (attach mode). |
 | `interrupt` / `stop` | Send Ctrl+C to interrupt Claude (attach mode). |
+| `//skill-name [args]` | Invoke a Claude Code skill (e.g., `//commit`, `//investigate`). |
+| `!skills` | List available Claude Code skills. |
 
 ## Install
 
