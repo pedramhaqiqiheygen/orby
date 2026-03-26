@@ -19,8 +19,10 @@ Commands:
 import asyncio
 import logging
 import re
+import shutil
 import sys
 import time
+from pathlib import Path
 
 from slack_bolt.app.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -60,6 +62,7 @@ tmux_agent = TmuxAgent(session_mgr=session_mgr)
 
 # Track running SDK tasks so they can be cancelled via !kill
 _running_tasks: dict[str, asyncio.Task] = {}  # session_key -> asyncio.Task
+_session_uploads: dict[str, list[str]] = {}  # session_key -> [file_paths]
 
 
 # -- Helpers ------------------------------------------------------------------
@@ -67,6 +70,67 @@ _running_tasks: dict[str, asyncio.Task] = {}  # session_key -> asyncio.Task
 def parse_message(text: str) -> str:
     """Strip bot mention from message text."""
     return re.sub(r"<@[\w]+>", "", text).strip()
+
+
+def _cleanup_uploads(max_age_hours: int = 24):
+    """Delete upload files older than max_age_hours."""
+    upload_dir = ORBY_DIR / "uploads"
+    if not upload_dir.is_dir():
+        return
+    cutoff = time.time() - (max_age_hours * 3600)
+    removed = 0
+    for session_dir in upload_dir.iterdir():
+        if not session_dir.is_dir():
+            continue
+        for f in session_dir.iterdir():
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink()
+                removed += 1
+        # Remove empty session dirs
+        if session_dir.is_dir() and not any(session_dir.iterdir()):
+            session_dir.rmdir()
+    if removed:
+        log.info("Cleaned up %d old uploads", removed)
+
+
+def _cleanup_session_uploads(session_key: str):
+    """Delete all uploads for a specific session."""
+    _session_uploads.pop(session_key, None)
+    safe_key = session_key.replace("/", "_")
+    session_dir = ORBY_DIR / "uploads" / safe_key
+    if session_dir.is_dir():
+        shutil.rmtree(session_dir, ignore_errors=True)
+        log.info("Cleaned up uploads for session %s", session_key)
+
+
+async def _download_files(files: list[dict], session_key: str) -> list[str]:
+    """Download Slack files to ~/.orby/uploads/<session>/, return local paths."""
+    import aiohttp
+
+    safe_key = session_key.replace("/", "_")
+    upload_dir = ORBY_DIR / "uploads" / safe_key
+    upload_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+
+    for f in files:
+        url = f.get("url_private_download")
+        if not url:
+            continue
+        name = f.get("name", "file")
+        dest = upload_dir / f"{int(time.time())}_{name}"
+
+        async with aiohttp.ClientSession() as session:
+            headers = {"Authorization": f"Bearer {cfg['slack_bot_token']}"}
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    dest.write_bytes(await resp.read())
+                    paths.append(str(dest))
+                    log.info("Downloaded file: %s (%d bytes)", dest.name, f.get("size", 0))
+                else:
+                    log.warning("Failed to download %s: HTTP %d", name, resp.status)
+
+    _session_uploads.setdefault(session_key, []).extend(paths)
+    return paths
 
 
 # -- Event handlers -----------------------------------------------------------
@@ -80,9 +144,52 @@ async def handle_mention(event, client, say):
 async def handle_dm(event, client, say):
     if event.get("channel_type") != "im":
         return
-    if event.get("bot_id") or event.get("subtype"):
+    if event.get("bot_id"):
+        return
+    if event.get("subtype") and event.get("subtype") != "file_share":
         return
     await _handle(event, client)
+
+
+@app.event("reaction_added")
+async def handle_reaction(event, client, say):
+    emoji = event.get("reaction")
+    if emoji not in ("white_check_mark", "unlock", "x"):
+        return
+
+    # Ignore bot's own reactions
+    bot_info = await client.auth_test()
+    if event.get("user") == bot_info.get("user_id"):
+        return
+
+    item = event.get("item", {})
+    channel = item.get("channel")
+    msg_ts = item.get("ts")
+    if not channel or not msg_ts:
+        return
+
+    # Find the thread this message belongs to
+    result = await client.conversations_history(
+        channel=channel, latest=msg_ts, inclusive=True, limit=1)
+    msgs = result.get("messages", [])
+    if not msgs:
+        return
+    thread_ts = msgs[0].get("thread_ts", msg_ts)
+
+    session_key = SessionManager.make_key(channel, thread_ts)
+    session = session_mgr.get(session_key)
+    if not session or session.get("agent_type") != "tmux":
+        return
+
+    if emoji == "white_check_mark":
+        await tmux_agent.approve(session_key)
+        log.info("Reaction approve (once) for %s", session_key)
+    elif emoji == "unlock":
+        await tmux_agent.allow_session(session_key)
+        log.info("Reaction approve (session) for %s", session_key)
+    elif emoji == "x":
+        await tmux_agent.reject(session_key)
+        log.info("Reaction reject for %s", session_key)
 
 
 async def _handle(event: dict, client):
@@ -91,6 +198,14 @@ async def _handle(event: dict, client):
     thread_ts = event.get("thread_ts") or event["ts"]
     prompt = parse_message(event.get("text", ""))
     session_key = SessionManager.make_key(channel, thread_ts)
+
+    # Handle file uploads — download and prepend paths to prompt
+    files = event.get("files", [])
+    if files:
+        downloaded = await _download_files(files, session_key)
+        if downloaded:
+            file_refs = "\n".join(f"[Uploaded file: {path}]" for path in downloaded)
+            prompt = f"{file_refs}\n\n{prompt}" if prompt else file_refs
 
     if not prompt:
         await client.chat_postMessage(
@@ -129,6 +244,14 @@ async def _handle(event: dict, client):
 
     if prompt.lower().startswith("!create "):
         await _cmd_create(client, channel, thread_ts, session_key, prompt[8:].strip())
+        return
+
+    if prompt == "!cleanup":
+        _cleanup_uploads(max_age_hours=0)
+        await client.chat_postMessage(
+            channel=channel, thread_ts=thread_ts,
+            text=":broom: All uploads cleaned up.",
+        )
         return
 
     if prompt.lower() in ("!interrupt", "!stop"):
@@ -362,6 +485,7 @@ async def _cmd_kill(client, channel, thread_ts, session_key):
             )
             await proc.communicate()
             session_mgr.delete(session_key)
+            _cleanup_session_uploads(session_key)
             if proc.returncode == 0:
                 await client.chat_postMessage(
                     channel=channel, thread_ts=thread_ts,
@@ -378,6 +502,7 @@ async def _cmd_kill(client, channel, thread_ts, session_key):
         if task and not task.done():
             task.cancel()
         session_mgr.delete(session_key)
+        _cleanup_session_uploads(session_key)
         await client.chat_postMessage(
             channel=channel, thread_ts=thread_ts,
             text=":skull: Killed SDK session.",
@@ -406,7 +531,7 @@ async def _cmd_create(client, channel, thread_ts, session_key, name):
     proc = await asyncio.create_subprocess_exec(
         "tmux", "new-session", "-d", "-s", name,
         "-c", work_dir,
-        "claude",
+        "claude", "--permission-mode", cfg["permission_mode"],
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
     )
     await proc.communicate()
@@ -584,6 +709,7 @@ async def _handle_sdk(client, channel, thread_ts, session_key, prompt):
 # -- Main ---------------------------------------------------------------------
 
 async def main():
+    _cleanup_uploads(max_age_hours=24)  # clean stale uploads on startup
     handler = AsyncSocketModeHandler(app, cfg["slack_app_token"])
     log.info("Orby is online.")
     await handler.start_async()

@@ -105,14 +105,16 @@ if [[ -z "$SKIP_SLACK" ]]; then
     echo
 
     printf "  ${DIM}4.${RESET} OAuth & Permissions > add ${BOLD}Bot Token Scopes${RESET}:\n"
-    printf "     ${DIM}app_mentions:read  chat:write  im:history  im:read  im:write${RESET}\n"
+    printf "     ${DIM}app_mentions:read  chat:write  files:read${RESET}\n"
+    printf "     ${DIM}im:history  im:read  im:write${RESET}\n"
+    printf "     ${DIM}reactions:read  reactions:write${RESET}\n"
     printf "  ${DIM}5.${RESET} Install App to Workspace > copy Bot User OAuth Token\n"
     printf "\n"
     read -p "  SLACK_BOT_TOKEN (xoxb-...): " BOT_TOKEN
     echo
 
     printf "  ${DIM}6.${RESET} Event Subscriptions > Enable > Subscribe to bot events:\n"
-    printf "     ${DIM}app_mention  message.im${RESET}\n"
+    printf "     ${DIM}app_mention  message.im  reaction_added${RESET}\n"
     printf "  ${DIM}7.${RESET} App Home > Messages Tab > check 'Allow users to send...'\n"
     printf "\n"
     read -p "  Press Enter when done... "
