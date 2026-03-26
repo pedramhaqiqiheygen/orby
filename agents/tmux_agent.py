@@ -69,11 +69,12 @@ class TmuxAgent(Agent):
         return True
 
     async def allow_session(self, session_key: str) -> bool:
-        """Allow for this session (option 2)."""
+        """Allow for this session (option 2) — navigate down to it then Enter."""
         tmux_name = self._get_tmux_name(session_key)
         if not tmux_name:
             return False
-        await self._keys(tmux_name, "s")
+        await self._keys(tmux_name, "Down")
+        await asyncio.sleep(0.1)
         await self._keys(tmux_name, "Enter")
         return True
 

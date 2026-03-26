@@ -63,9 +63,30 @@ def _post_to_slack(bot_token: str, channel: str, thread_ts: str, text: str) -> s
     )
     try:
         resp = urlopen(req, timeout=4)
-        return resp.read().decode()[:200]
+        return resp.read().decode()
     except Exception as e:
         return f"ERROR: {e}"
+
+
+def _add_reaction(bot_token: str, channel: str, timestamp: str, emoji: str):
+    """Add an emoji reaction to a Slack message."""
+    payload = json.dumps({
+        "channel": channel,
+        "timestamp": timestamp,
+        "name": emoji,
+    }).encode()
+    req = Request(
+        "https://slack.com/api/reactions.add",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {bot_token}",
+        },
+    )
+    try:
+        urlopen(req, timeout=4)
+    except Exception:
+        pass
 
 
 def _get_last_response(transcript_path: str) -> str | None:
@@ -334,8 +355,23 @@ def main():
     # Post to Slack
     try:
         cfg = load_config()
-        resp = _post_to_slack(cfg["slack_bot_token"], channel, thread_ts, text)
-        _log(f"  slack response: {resp}")
+        bot_token = cfg["slack_bot_token"]
+        resp = _post_to_slack(bot_token, channel, thread_ts, text)
+        _log(f"  slack response: {resp[:200]}")
+
+        # Add emoji reactions to permission messages
+        if args.event == "PermissionRequest":
+            try:
+                resp_data = json.loads(resp)
+                msg_ts = resp_data.get("ts")
+                if msg_ts:
+                    _add_reaction(bot_token, channel, msg_ts, "white_check_mark")  # Yes (once)
+                    _add_reaction(bot_token, channel, msg_ts, "unlock")  # Yes, allow for session
+                    _add_reaction(bot_token, channel, msg_ts, "x")  # No
+                    _log("  added reaction buttons")
+            except (json.JSONDecodeError, KeyError):
+                _log("  failed to add reaction buttons")
+
     except Exception as e:
         _log(f"  slack error: {e}")
 
